@@ -2,16 +2,21 @@ use std::{
     fs::File,
     io::Write,
     path::{Path, PathBuf},
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
-use miden_lib::{AuthScheme, account::faucets::create_basic_fungible_faucet, utils::Serializable};
+use miden_lib::{
+    AuthScheme,
+    account::{faucets::create_basic_fungible_faucet, wallets::create_basic_wallet},
+    utils::Serializable,
+};
 use miden_node_store::{genesis::GenesisState, server::Store};
 use miden_node_utils::{crypto::get_rpo_random_coin, grpc::UrlExt};
 use miden_objects::{
     Felt, ONE,
-    account::{AccountFile, AccountIdAnchor, AuthSecretKey},
+    account::{AccountFile, AccountIdAnchor, AccountType, AuthSecretKey},
     asset::TokenSymbol,
     crypto::dsa::rpo_falcon512::SecretKey,
 };
@@ -175,25 +180,37 @@ impl StoreCommand {
     }
 
     fn generate_account(input: AccountInput, rng: &mut ChaChaRng) -> anyhow::Result<AccountFile> {
-        let AccountInput::BasicFungibleFaucet(input) = input;
-
-        let (auth_scheme, auth_secret_key) = input.auth_scheme.gen_auth_keys(rng);
-
-        let storage_mode = input.storage_mode.as_str().try_into()?;
-        let (mut account, account_seed) = create_basic_fungible_faucet(
-            rng.random(),
-            AccountIdAnchor::PRE_GENESIS,
-            TokenSymbol::try_from(input.token_symbol.as_str())?,
-            input.decimals,
-            Felt::try_from(input.max_supply)
-                .map_err(|err| anyhow::anyhow!("{err}"))
-                .context("failed to parse max supply")?,
-            storage_mode,
-            auth_scheme,
-        )?;
-
-        // TODO: why do we do this?
-        account.set_nonce(ONE).context("failed to set account nonce to 1")?;
+        let (account, account_seed, auth_secret_key) = match input {
+            AccountInput::BasicFungibleFaucet(input) => {
+                let (auth_scheme, auth_secret_key) = input.auth_scheme.gen_auth_keys(rng);
+                let storage_mode = input.storage_mode.as_str().try_into()?;
+                let (account, account_seed) = create_basic_fungible_faucet(
+                    rng.random(),
+                    AccountIdAnchor::PRE_GENESIS,
+                    TokenSymbol::try_from(input.token_symbol.as_str())?,
+                    input.decimals,
+                    Felt::try_from(input.max_supply)
+                        .map_err(|err| anyhow::anyhow!("{err}"))
+                        .context("failed to parse max supply")?,
+                    storage_mode,
+                    auth_scheme,
+                )?;
+                (account, account_seed, auth_secret_key)
+            },
+            AccountInput::BasicWallet(input) => {
+                let (auth_scheme, auth_secret_key) = input.auth_scheme.gen_auth_keys(rng);
+                let storage_mode = input.storage_mode.as_str().try_into()?;
+                let account_type = AccountType::from_str(input.account_type.as_str())?;
+                let (account, account_seed) = create_basic_wallet(
+                    rng.random(),
+                    AccountIdAnchor::PRE_GENESIS,
+                    auth_scheme,
+                    account_type,
+                    storage_mode,
+                )?;
+                (account, account_seed, auth_secret_key)
+            },
+        };
 
         Ok(AccountFile::new(account, Some(account_seed), auth_secret_key))
     }
@@ -210,6 +227,7 @@ pub struct GenesisConfig {
 #[serde(tag = "type")]
 pub enum AccountInput {
     BasicFungibleFaucet(BasicFungibleFaucetInputs),
+    BasicWallet(BasicWalletInputs),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -219,6 +237,13 @@ pub struct BasicFungibleFaucetInputs {
     pub decimals: u8,
     pub max_supply: u64,
     pub storage_mode: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BasicWalletInputs {
+    pub auth_scheme: AuthSchemeInput,
+    pub storage_mode: String,
+    pub account_type: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
