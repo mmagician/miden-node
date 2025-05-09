@@ -78,7 +78,7 @@ pub enum VerifyTxError {
 
 #[derive(Debug, Error)]
 pub enum AddTransactionError {
-    #[error("transaction verification failed")]
+    #[error("transaction verification failed: {0}")]
     VerificationFailed(#[from] VerifyTxError),
 
     #[error(
@@ -89,7 +89,7 @@ pub enum AddTransactionError {
         stale_limit: BlockNumber,
     },
 
-    #[error("transaction deserialization failed")]
+    #[error("transaction deserialization failed: {0}")]
     TransactionDeserializationFailed(#[source] miden_objects::utils::DeserializationError),
 
     #[error(
