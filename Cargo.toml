@@ -72,3 +72,8 @@ module_name_repetitions     = "allow" # Many triggers, and is a stylistic choice
 must_use_candidate          = "allow" # This marks many fn's which isn't helpful.
 should_panic_without_expect = "allow" # We don't care about the specific panic message.
 # End of pedantic lints.
+
+[patch.crates-io]
+miden-lib = { git = "https://github.com/mmagician/miden-base", branch = "wallet-with-assets-helper"}
+# need to patch this too due to how deps are pulled in
+miden-objects = { git = "https://github.com/mmagician/miden-base", branch = "wallet-with-assets-helper"}
