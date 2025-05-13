@@ -1,18 +1,23 @@
 use std::{
+    collections::HashMap,
     fs::File,
     io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
-use miden_lib::{AuthScheme, account::faucets::create_basic_fungible_faucet, utils::Serializable};
+use anyhow::{Context, Error, anyhow};
+use miden_lib::{
+    AuthScheme,
+    account::{faucets::create_basic_fungible_faucet, wallets::create_basic_wallet_with_assets},
+    utils::Serializable,
+};
 use miden_node_store::{genesis::GenesisState, server::Store};
 use miden_node_utils::{crypto::get_rpo_random_coin, grpc::UrlExt};
 use miden_objects::{
-    Felt, ONE,
-    account::{AccountFile, AccountIdAnchor, AuthSecretKey},
-    asset::TokenSymbol,
+    Felt,
+    account::{AccountFile, AccountId, AccountIdAnchor, AccountType, AuthSecretKey},
+    asset::{Asset, FungibleAsset, TokenSymbol},
     crypto::dsa::rpo_falcon512::SecretKey,
 };
 use rand::{Rng, SeedableRng};
@@ -138,23 +143,72 @@ impl StoreCommand {
         // Generate the accounts.
         let mut rng = ChaCha20Rng::from_seed(rand::random());
         let n_accounts = accounts.as_ref().map(Vec::len).unwrap_or_default();
-        let accounts = accounts
-            .into_iter()
+
+        let mut asset_map = HashMap::new();
+        let mut all_accounts = accounts
+            .iter()
             .flatten()
             .enumerate()
-            .inspect(|(idx, _)| tracing::info!(index=%idx, total=n_accounts, "Generating account"))
-            .map(|(idx, input)| {
-                Self::generate_account(input, &mut rng)
-                    .with_context(|| format!("failed to generate account {idx}"))
+            .filter_map(|(idx, input)| match input {
+                AccountInput::BasicFungibleFaucet(input) => {
+                    tracing::info!(index=%idx, total=n_accounts, "Generating faucet account");
+
+                    let token_symbol = &input.token_symbol;
+                    match Self::generate_faucet_account(input, &mut rng)
+                        .with_context(|| format!("failed to generate account {idx}"))
+                    {
+                        Ok(account) => {
+                            asset_map.insert(token_symbol, account.account.id());
+                            Some(Ok(account))
+                        },
+                        Err(e) => Some(Err(e)),
+                    }
+                },
+                _ => None,
             })
             .collect::<Result<Vec<AccountFile>, _>>()
-            .context("failed to generate accounts")?;
+            .context("failed to generate faucet accounts")?;
 
+        let basic_wallet_accounts = accounts
+            .iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(idx, input)| match input {
+                AccountInput::BasicWallet(input) => {
+                    tracing::info!(index=%idx, total=n_accounts, "Generating wallet account");
+
+                    let assets = match &input.assets {
+                        Some(asset_inputs) => asset_inputs
+                            .iter()
+                            .map(|asset_input| asset_input.to_assets(&asset_map))
+                            .collect(),
+                        None => Ok(Vec::new()),
+                    };
+
+                    match assets {
+                        Ok(assets) => Some(
+                            Self::generate_wallet_account(input, &mut rng, assets).with_context(
+                                || format!("Failed to generate wallet account {idx}"),
+                            ),
+                        ),
+                        Err(e) => {
+                            Some(Err(e).with_context(|| {
+                                format!("Failed to generate wallet account {idx}")
+                            }))
+                        },
+                    }
+                },
+                _ => None,
+            })
+            .collect::<Result<Vec<AccountFile>, _>>()
+            .context("failed to generate basic wallet accounts")?;
+
+        all_accounts.extend(basic_wallet_accounts);
         // Write account data to disk (including secrets).
         //
         // Without this private accounts would be inaccessible by the user.
         // This is not used directly by the node, but rather by the owner / operator of the node.
-        for (idx, account) in accounts.iter().enumerate() {
+        for (idx, account) in all_accounts.iter().enumerate() {
             let filepath = accounts_directory.join(format!("account_{idx}.mac"));
             File::create_new(&filepath)
                 .and_then(|mut file| file.write_all(&account.to_bytes()))
@@ -164,7 +218,7 @@ impl StoreCommand {
         }
 
         // Write the genesis state to disk. This is used to seed the database's genesis block.
-        let accounts = accounts.into_iter().map(|account| account.account).collect();
+        let accounts = all_accounts.into_iter().map(|account| account.account).collect();
         let genesis_state = GenesisState::new(accounts, version, timestamp);
         let genesis_output = data_directory.join(miden_node_store::GENESIS_STATE_FILENAME);
         File::create_new(&genesis_output)
@@ -174,28 +228,47 @@ impl StoreCommand {
             })
     }
 
-    fn generate_account(input: AccountInput, rng: &mut ChaChaRng) -> anyhow::Result<AccountFile> {
-        let AccountInput::BasicFungibleFaucet(input) = input;
-
-        let (auth_scheme, auth_secret_key) = input.auth_scheme.gen_auth_keys(rng);
-
-        let storage_mode = input.storage_mode.as_str().try_into()?;
-        let (mut account, account_seed) = create_basic_fungible_faucet(
-            rng.random(),
-            AccountIdAnchor::PRE_GENESIS,
-            TokenSymbol::try_from(input.token_symbol.as_str())?,
-            input.decimals,
-            Felt::try_from(input.max_supply)
-                .map_err(|err| anyhow::anyhow!("{err}"))
-                .context("failed to parse max supply")?,
-            storage_mode,
-            auth_scheme,
-        )?;
-
-        // TODO: why do we do this?
-        account.set_nonce(ONE).context("failed to set account nonce to 1")?;
+    fn generate_faucet_account(
+        input: &BasicFungibleFaucetInputs,
+        rng: &mut ChaChaRng,
+    ) -> anyhow::Result<AccountFile> {
+        let (account, account_seed, auth_secret_key) = {
+            let (auth_scheme, auth_secret_key) = input.auth_scheme.gen_auth_keys(rng);
+            let storage_mode = input.storage_mode.as_str().try_into()?;
+            let (account, account_seed) = create_basic_fungible_faucet(
+                rng.random(),
+                AccountIdAnchor::PRE_GENESIS,
+                TokenSymbol::try_from(input.token_symbol.as_str())?,
+                input.decimals,
+                Felt::try_from(input.max_supply)
+                    .map_err(|err| anyhow!("{err}"))
+                    .context("failed to parse max supply")?,
+                storage_mode,
+                auth_scheme,
+            )?;
+            (account, account_seed, auth_secret_key)
+        };
 
         Ok(AccountFile::new(account, Some(account_seed), auth_secret_key))
+    }
+
+    fn generate_wallet_account(
+        input: &BasicWalletInputs,
+        rng: &mut ChaChaRng,
+        assets: Vec<Asset>,
+    ) -> anyhow::Result<AccountFile> {
+        let (auth_scheme, auth_secret_key) = input.auth_scheme.gen_auth_keys(rng);
+        let storage_mode = input.storage_mode.as_str().try_into()?;
+        let account_type = input.account_type;
+        let account = create_basic_wallet_with_assets(
+            rng.random(),
+            AccountIdAnchor::PRE_GENESIS,
+            auth_scheme,
+            account_type,
+            storage_mode,
+            assets,
+        )?;
+        Ok(AccountFile::new(account, None, auth_secret_key))
     }
 }
 
@@ -210,6 +283,7 @@ pub struct GenesisConfig {
 #[serde(tag = "type")]
 pub enum AccountInput {
     BasicFungibleFaucet(BasicFungibleFaucetInputs),
+    BasicWallet(BasicWalletInputs),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -219,6 +293,33 @@ pub struct BasicFungibleFaucetInputs {
     pub decimals: u8,
     pub max_supply: u64,
     pub storage_mode: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BasicWalletInputs {
+    pub auth_scheme: AuthSchemeInput,
+    pub storage_mode: String,
+    pub account_type: AccountType,
+    pub assets: Option<Vec<AssetInput>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AssetInput {
+    pub token_symbol: String,
+    pub amount: u64,
+}
+
+impl AssetInput {
+    fn to_assets(&self, asset_map: &HashMap<&String, AccountId>) -> Result<Asset, Error> {
+        let faucet_account_id = asset_map.get(&self.token_symbol).ok_or_else(|| {
+            anyhow!("Faucet for token symbol '{}' not found in asset map", self.token_symbol)
+        })?;
+        FungibleAsset::new(*faucet_account_id, self.amount)
+            .map(Asset::Fungible)
+            .with_context(|| {
+                format!("Failed to create fungible asset for faucet '{}'", self.token_symbol)
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -269,5 +370,45 @@ mod tests {
     #[tokio::test]
     async fn dump_config_succeeds() {
         StoreCommand::DumpGenesis.handle().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_with_assets() {
+        let temp_dir_data = tempfile::tempdir().unwrap();
+        let temp_dir_accounts = tempfile::tempdir().unwrap();
+        let config_file = temp_dir_data.path().join("config.toml");
+        let config = r#"
+            version = 1
+            timestamp = 1717344256
+
+            [[accounts]]
+            type = "BasicFungibleFaucet"
+            auth_scheme = "RpoFalcon512"
+            token_symbol = "MID"
+            decimals = 12
+            max_supply = 1000000
+            storage_mode = "public"
+
+            [[accounts]]
+            type = "BasicWallet"
+            auth_scheme = "RpoFalcon512"
+            storage_mode = "private"
+            account_type = "RegularAccountImmutableCode"
+            assets = [
+                { token_symbol = "MID", amount = 1000 }
+            ]
+
+        "#;
+
+        std::fs::write(&config_file, config).unwrap();
+
+        StoreCommand::Bootstrap {
+            config: Some((&config_file).into()),
+            data_directory: temp_dir_data.path().to_path_buf(),
+            accounts_directory: temp_dir_accounts.path().to_path_buf(),
+        }
+        .handle()
+        .await
+        .unwrap();
     }
 }

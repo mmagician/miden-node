@@ -20,7 +20,7 @@ tracing-forest = ["miden-node-block-producer/tracing-forest"]
 [dependencies]
 anyhow                    = { workspace = true }
 clap                      = { version = "4.5", features = ["derive", "env", "string"] }
-miden-lib                 = { workspace = true }
+miden-lib                 = { workspace = true, features = ["testing"] }
 miden-node-block-producer = { workspace = true }
 miden-node-rpc            = { workspace = true }
 miden-node-store          = { workspace = true }
@@ -37,6 +37,7 @@ url                       = { workspace = true }
 [dev-dependencies]
 figment          = { version = "0.10", features = ["env", "test", "toml"] }
 miden-node-utils = { workspace = true, features = ["tracing-forest"] }
+tempfile          = { version = "3.19" }
 
 [build-dependencies]
 # Required to inject build metadata.
