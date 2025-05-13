@@ -375,4 +375,45 @@ mod tests {
     async fn dump_config_succeeds() {
         StoreCommand::DumpGenesis.handle().await.unwrap();
     }
+
+    // write a test for Bootstrap, which uses temp directories
+    #[tokio::test]
+    async fn bootstrap_with_assets() {
+        let temp_dir_data = tempfile::tempdir().unwrap();
+        let temp_dir_accounts = tempfile::tempdir().unwrap();
+        let config_file = temp_dir_data.path().join("config.toml");
+        let config = r#"
+            version = 1
+            timestamp = 1717344256
+
+            [[accounts]]
+            type = "BasicFungibleFaucet"
+            auth_scheme = "RpoFalcon512"
+            token_symbol = "MID"
+            decimals = 12
+            max_supply = 1000000
+            storage_mode = "public"
+
+            [[accounts]]
+            type = "BasicWallet"
+            auth_scheme = "RpoFalcon512"
+            storage_mode = "private"
+            account_type = "RegularAccountImmutableCode"
+            assets = [
+                { token_symbol = "MID", amount = 1000 }
+            ]
+
+        "#;
+
+        std::fs::write(&config_file, config).unwrap();
+
+        StoreCommand::Bootstrap {
+            config: Some((&config_file).into()),
+            data_directory: temp_dir_data.path().to_path_buf(),
+            accounts_directory: temp_dir_accounts.path().to_path_buf(),
+        }
+        .handle()
+        .await
+        .unwrap();
+    }
 }
