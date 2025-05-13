@@ -3,11 +3,10 @@ use std::{
     fs::File,
     io::Write,
     path::{Path, PathBuf},
-    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
+use anyhow::{Context, Error, anyhow};
 use miden_lib::{
     AuthScheme,
     account::{faucets::create_basic_fungible_faucet, wallets::create_basic_wallet_with_assets},
@@ -17,7 +16,7 @@ use miden_node_store::{genesis::GenesisState, server::Store};
 use miden_node_utils::{crypto::get_rpo_random_coin, grpc::UrlExt};
 use miden_objects::{
     Felt,
-    account::{AccountFile, AccountIdAnchor, AccountType, AuthSecretKey},
+    account::{AccountFile, AccountId, AccountIdAnchor, AccountType, AuthSecretKey},
     asset::{Asset, FungibleAsset, TokenSymbol},
     crypto::dsa::rpo_falcon512::SecretKey,
 };
@@ -154,7 +153,7 @@ impl StoreCommand {
                 AccountInput::BasicFungibleFaucet(input) => {
                     tracing::info!(index=%idx, total=n_accounts, "Generating faucet account");
 
-                    let token_symbol = input.token_symbol.clone();
+                    let token_symbol = &input.token_symbol;
                     match Self::generate_faucet_account(input, &mut rng)
                         .with_context(|| format!("failed to generate account {idx}"))
                     {
@@ -181,23 +180,7 @@ impl StoreCommand {
                     let assets = match &input.assets {
                         Some(asset_inputs) => asset_inputs
                             .iter()
-                            .map(|asset_input| {
-                                let faucet_account_id =
-                                    asset_map.get(&asset_input.token_symbol).ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "Faucet for token symbol '{}' not found in asset map",
-                                            asset_input.token_symbol,
-                                        )
-                                    })?;
-                                FungibleAsset::new(*faucet_account_id, asset_input.amount)
-                                    .map(Asset::Fungible)
-                                    .with_context(|| {
-                                        format!(
-                                            "Failed to create fungible asset for faucet '{}'",
-                                            asset_input.token_symbol,
-                                        )
-                                    })
-                            })
+                            .map(|asset_input| asset_input.to_assets(&asset_map))
                             .collect(),
                         None => Ok(Vec::new()),
                     };
@@ -258,7 +241,7 @@ impl StoreCommand {
                 TokenSymbol::try_from(input.token_symbol.as_str())?,
                 input.decimals,
                 Felt::try_from(input.max_supply)
-                    .map_err(|err| anyhow::anyhow!("{err}"))
+                    .map_err(|err| anyhow!("{err}"))
                     .context("failed to parse max supply")?,
                 storage_mode,
                 auth_scheme,
@@ -276,7 +259,7 @@ impl StoreCommand {
     ) -> anyhow::Result<AccountFile> {
         let (auth_scheme, auth_secret_key) = input.auth_scheme.gen_auth_keys(rng);
         let storage_mode = input.storage_mode.as_str().try_into()?;
-        let account_type = AccountType::from_str(input.account_type.as_str())?;
+        let account_type = input.account_type;
         let account = create_basic_wallet_with_assets(
             rng.random(),
             AccountIdAnchor::PRE_GENESIS,
@@ -316,7 +299,7 @@ pub struct BasicFungibleFaucetInputs {
 pub struct BasicWalletInputs {
     pub auth_scheme: AuthSchemeInput,
     pub storage_mode: String,
-    pub account_type: String,
+    pub account_type: AccountType,
     pub assets: Option<Vec<AssetInput>>,
 }
 
@@ -324,6 +307,19 @@ pub struct BasicWalletInputs {
 pub struct AssetInput {
     pub token_symbol: String,
     pub amount: u64,
+}
+
+impl AssetInput {
+    fn to_assets(&self, asset_map: &HashMap<&String, AccountId>) -> Result<Asset, Error> {
+        let faucet_account_id = asset_map.get(&self.token_symbol).ok_or_else(|| {
+            anyhow!("Faucet for token symbol '{}' not found in asset map", self.token_symbol)
+        })?;
+        FungibleAsset::new(*faucet_account_id, self.amount)
+            .map(Asset::Fungible)
+            .with_context(|| {
+                format!("Failed to create fungible asset for faucet '{}'", self.token_symbol)
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -376,7 +372,6 @@ mod tests {
         StoreCommand::DumpGenesis.handle().await.unwrap();
     }
 
-    // write a test for Bootstrap, which uses temp directories
     #[tokio::test]
     async fn bootstrap_with_assets() {
         let temp_dir_data = tempfile::tempdir().unwrap();
